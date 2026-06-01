@@ -192,7 +192,7 @@ class RobuClient:
             result["status"] = result.get("status", "seed_match")
             result["match_confidence"] = max(result.get("match_confidence", 0.0), _seed_confidence(query, seed))
             return result
-        return self._offline_guess(query)
+        return self._lookup_unavailable(query)
 
     def _web_search_product_links(self, query: str) -> list[str]:
         links: list[str] = []
@@ -228,7 +228,7 @@ class RobuClient:
                 return _merge_seed(seed, parsed)
         except requests.RequestException:
             pass
-        fallback = dict(seed) if seed else self._offline_guess(query)
+        fallback = dict(seed) if seed else self._lookup_unavailable(query)
         fallback.update({
             "query": query,
             "status": "seed_match",
@@ -263,22 +263,32 @@ class RobuClient:
                 "match_confidence": _seed_confidence(query, seed),
             })
             return result
-        return self._offline_guess(query)
+        return self._offline_disabled(query)
 
-    def _offline_guess(self, query: str) -> dict:
+    def _fallback_result(self, query: str, status: str, availability: str) -> dict:
         return {
             "query": query,
-            "status": "offline_fallback",
+            "status": status,
             "title": query,
             "category": _guess_category(query),
             "manufacturer": _guess_manufacturer(query),
             "package": _guess_package(query),
             "datasheet_link": "",
-            "availability": "Live lookup disabled or unavailable",
+            "availability": availability,
             "price": "",
             "similar_components": _similar_terms(query),
-            "match_confidence": 0.35,
+            "match_confidence": 0.0,
         }
+
+    def _offline_disabled(self, query: str) -> dict:
+        return self._fallback_result(query, "offline_fallback", "Live lookup disabled")
+
+    def _lookup_unavailable(self, query: str) -> dict:
+        return self._fallback_result(
+            query,
+            "lookup_unavailable",
+            "No Robu result found or Robu blocked lookup",
+        )
 
 
 def _tokenize(text: str) -> list[str]:
