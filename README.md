@@ -9,6 +9,7 @@ This is a final-year engineering project prototype for evaluating PCB and electr
 - Gerber ZIP analysis for board size, layer count, copper estimate, drill count, via density, component density, SMD ratio, edge placement, and disassembly difficulty.
 - Optional placement/centroid file support.
 - Robu.in enrichment layer with fuzzy search query creation, local cache, offline fallback, availability metadata, and a modular client design for future suppliers.
+- Optional ML-assisted component scoring using a trainable TF-IDF regression model.
 - End-of-life recovery estimate for copper, contacts, solder, FR4, plastics, metals, and batteries.
 - Streamlit UI with uploads, manual PCB fallback fields, explanations, and CSV/JSON/PDF exports.
 - Unit tests for ingestion, scoring, Gerber parsing, and recovery estimation.
@@ -102,6 +103,21 @@ The BoM score combines:
 - obsolescence risk: terms such as obsolete, EOL, discontinued, and NRND;
 - greener alternatives: compliance and safer-material signals.
 
+## ML-Assisted Scoring
+
+The app includes an optional supervised ML component for component-level sustainability prediction. It trains a TF-IDF + Ridge regression model from a CSV dataset with BoM-like fields and a `target_score` column from 0 to 100.
+
+Default demo training data is included at `samples/ml_training_components.csv`. In the UI, enable **ML-assisted scoring** to train from this sample file, or upload your own training CSV. The ML prediction is blended with the rule-based score using the sidebar blend weight.
+
+The ML output remains explainable:
+
+- predicted sustainability score;
+- confidence estimate based on feature coverage;
+- risk band: high risk, moderate risk, or lower risk;
+- influential terms found in the BoM/enrichment text.
+
+This is intentionally lightweight. It demonstrates where trained models fit into the architecture while preserving deterministic rule behavior for academic evaluation.
+
 The PCB design-for-recycling score combines:
 
 - disassembly difficulty from layer count, via density, SMD ratio, component density, and battery presence;
@@ -113,13 +129,22 @@ The final recyclability score combines component sustainability, PCB design-for-
 
 ## Robu.in Integration
 
-`RobuClient` builds a search query from each BoM row, checks `.cache/robu_results.json`, and only calls Robu.in when live lookup is enabled. It extracts the best available title, category, manufacturer guess, package guess, datasheet link, availability text, price, similar component hints, and match confidence.
+`RobuClient` builds a search query from each BoM row, checks `.cache/robu_results.json`, and only calls Robu.in when live lookup is enabled. It extracts the best available title, category, manufacturer guess, package guess, datasheet link, availability text, price, similar component hints, source URL, and match confidence.
 
-If the network is blocked, the page layout changes, or no result is found, the pipeline returns structured fallback data instead of failing the analysis. This keeps the academic demo reliable while making the supplier layer replaceable later with DigiKey, Mouser, LCSC, Octopart, or a formal API.
+Robu.in may return bot-protection pages to automated Python requests. The integration therefore uses a multi-step lookup:
+
+- If the BoM contains a `supplier_url`, `product url`, `robu url`, `url`, or `link` column with a Robu product URL, parse that product page directly.
+- Otherwise try direct Robu.in search using the part number, manufacturer, description, value, and footprint/package fields.
+- Search terms are expanded for both SMD and through-hole parts, including 0603/0805/QFN/SOT/BGA, THT, through-hole, DIP, axial, radial, pin headers, JST connectors, and terminal blocks.
+- If Robu blocks direct search, try a public Robu page reader.
+- If search pages still do not expose product links, use a Robu-scoped URL discovery fallback (`site:robu.in/product ...`) and then parse the discovered Robu product page.
+- If all live discovery fails, return structured fallback data, with match confidence and status labels.
+
+This makes arbitrary component lookup best-effort without pretending there is a guaranteed official API. For the most reliable results, include exact Robu product URLs in the BoM when available. The supplier layer is isolated so DigiKey, Mouser, LCSC, Octopart, or a formal API can be added later.
 
 ## ML Extension Points
 
-`SustainabilityModel` in `scoring.py` defines the interface a future trained model can implement. The current `RuleBasedSustainabilityScorer` can be replaced with a classifier, ranking model, embedding search system, or LLM-assisted alternatives recommender without changing the Streamlit app.
+`SustainabilityModel` in `scoring.py` defines the interface a future trained model can implement. The current `RuleBasedSustainabilityScorer` can be replaced or blended with a classifier, ranking model, embedding search system, or LLM-assisted alternatives recommender. The `ml.py` module already demonstrates this pattern with a trainable text regression model.
 
 ## Notes
 
