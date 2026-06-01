@@ -16,7 +16,7 @@ def test_robu_unknown_component_gracefully_falls_back(tmp_path):
     client = RobuClient(cache_path=tmp_path / "cache.json", delay_seconds=0)
     result = client.search("very unusual custom asic xyz123", enabled=False)
     assert result["status"] == "offline_fallback"
-    assert result["availability"] == "Live lookup disabled or unavailable"
+    assert result["availability"] == "Live lookup disabled"
 
 
 def test_bom_can_carry_supplier_url_column():
