@@ -64,6 +64,11 @@ with st.sidebar:
     st.divider()
     online_robu = st.toggle("Enable live Robu.in lookup", value=True)
     enrich_limit = st.number_input("Robu lookup row limit", min_value=1, max_value=100, value=20)
+    if st.button("Clear Robu lookup cache", use_container_width=True):
+        cache_path = ROOT / ".cache" / "robu_results.json"
+        if cache_path.exists():
+            cache_path.unlink()
+        st.success("Robu lookup cache cleared.")
     if not online_robu:
         st.warning("Live Robu lookup is off. Availability and price will use offline fallback data.")
     st.divider()
