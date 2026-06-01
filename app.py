@@ -157,6 +157,15 @@ with top_cols[2]:
 
 st.subheader("Component Sustainability Report")
 component_df = component_scores_to_dataframe(component_scores)
+if "robu_status" in component_df.columns:
+    unavailable_statuses = {"offline_fallback", "lookup_unavailable", "network_error", "missing_query"}
+    statuses = set(component_df["robu_status"].dropna().astype(str))
+    if statuses and statuses.issubset(unavailable_statuses):
+        st.warning(
+            "Robu enrichment did not return live product data for this run. "
+            "Make sure live lookup is enabled, clear the Robu cache, or add exact Robu product links "
+            "in a `supplier_url` / `robu_url` / `product url` BoM column for reliable parsing."
+        )
 st.dataframe(component_df, use_container_width=True, hide_index=True)
 
 st.subheader("PCB Layout Features")
