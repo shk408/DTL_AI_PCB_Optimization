@@ -20,6 +20,7 @@ CANONICAL_COLUMNS = {
     "compliance": ["compliance", "rohs", "reach", "halogen free", "lead free"],
     "lifecycle": ["lifecycle", "status", "obsolete"],
     "reference": ["reference", "designator", "refdes", "refs"],
+    "supplier_url": ["supplier url", "source url", "product url", "robu url", "url", "link"],
 }
 
 

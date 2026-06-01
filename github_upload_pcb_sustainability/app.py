@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 from pcb_sustainability.export import build_json_report, component_csv_bytes, pdf_report_bytes
 from pcb_sustainability.gerber import merge_manual_features, parse_gerber_zip, score_pcb
 from pcb_sustainability.ingestion import load_bom, load_placement
+from pcb_sustainability.ml import apply_ml_predictions, predict_bom, train_predictor_from_csv
 from pcb_sustainability.models import PCBFeatures
 from pcb_sustainability.recycling import estimate_recovery
 from pcb_sustainability.robu import RobuClient
@@ -64,6 +65,12 @@ with st.sidebar:
     online_robu = st.toggle("Enable live Robu.in lookup", value=False)
     enrich_limit = st.number_input("Robu lookup row limit", min_value=1, max_value=100, value=20)
     st.divider()
+    st.subheader("ML scoring")
+    enable_ml = st.toggle("Enable ML-assisted scoring", value=False)
+    ml_blend = st.slider("ML blend weight", min_value=0.0, max_value=0.5, value=0.25, step=0.05)
+    ml_training_file = st.file_uploader("Optional ML training CSV", type=["csv"])
+    st.caption("Training CSV must include component fields and `target_score` from 0 to 100.")
+    st.divider()
     st.subheader("Manual PCB fallback")
     manual = {
         "board_width_mm": st.number_input("Board width (mm)", min_value=0.0, value=80.0),
@@ -106,6 +113,15 @@ with st.spinner("Enriching components and scoring sustainability..."):
     client = RobuClient()
     enrichments = client.enrich_bom(bom_df, enabled=online_robu, limit=int(enrich_limit))
     component_scores, bom_summary = score_bom(bom_df, enrichments)
+    ml_error = None
+    if enable_ml:
+        try:
+            training_source = ml_training_file or (ROOT / "samples" / "ml_training_components.csv")
+            predictor = train_predictor_from_csv(training_source)
+            predictions = predict_bom(bom_df, predictor, enrichments)
+            component_scores, bom_summary = apply_ml_predictions(component_scores, predictions, ml_blend)
+        except Exception as exc:
+            ml_error = str(exc)
 
 if gerber_zip:
     try:
@@ -119,6 +135,10 @@ pcb_features = merge_manual_features(pcb_features, manual)
 pcb_score = score_pcb(pcb_features)
 recovery = estimate_recovery(component_scores, pcb_features, pcb_score)
 report = build_json_report(component_scores, bom_summary, pcb_features, pcb_score, recovery)
+if enable_ml and ml_error:
+    st.warning(f"ML scoring was skipped: {ml_error}")
+elif enable_ml:
+    st.success(f"ML-assisted scoring enabled. Rule scores are blended with ML predictions at {int(ml_blend * 100)}% ML weight.")
 
 top_cols = st.columns(3)
 with top_cols[0]:
@@ -134,7 +154,7 @@ st.dataframe(component_df, use_container_width=True, hide_index=True)
 
 st.subheader("PCB Layout Features")
 feature_cols = st.columns(4)
-feature_cols[0].metric("Board area", f"{pcb_features.board_area_mm2 or 0:.1f} mm²")
+feature_cols[0].metric("Board area", f"{pcb_features.board_area_mm2 or 0:.1f} mm2")
 feature_cols[1].metric("Layers", pcb_features.layer_count)
 feature_cols[2].metric("Hole / via count", f"{pcb_features.hole_count} / {pcb_features.via_count}")
 feature_cols[3].metric("SMD ratio", f"{pcb_features.smd_ratio:.0%}")
@@ -148,12 +168,12 @@ with left:
     st.markdown("**Component-level warnings**")
     for item in component_scores:
         for rec in item.recommendations[:2]:
-            st.write(f"**{item.part_number}** · {rec.label} · Priority: {rec.priority} · Confidence: {rec.confidence}")
+            st.write(f"**{item.part_number}** | {rec.label} | Priority: {rec.priority} | Confidence: {rec.confidence}")
             st.caption(rec.reason)
 with right:
     st.markdown("**PCB and recovery warnings**")
     for rec in pcb_score.recommendations:
-        st.write(f"**{rec.label}** · Priority: {rec.priority} · Confidence: {rec.confidence}")
+        st.write(f"**{rec.label}** | Priority: {rec.priority} | Confidence: {rec.confidence}")
         st.caption(rec.reason)
     st.markdown("**Recovery factors**")
     for factor in recovery.positive_factors:

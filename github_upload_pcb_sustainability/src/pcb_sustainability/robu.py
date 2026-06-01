@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import time
+from html import unescape
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 import pandas as pd
 import requests
@@ -15,7 +16,12 @@ from .utils import cache_key, normalize_text, read_json, write_json
 
 
 DEFAULT_CACHE = Path(".cache/robu_results.json")
-USER_AGENT = "PCB-Sustainability-Academic-Prototype/0.1"
+SEED_PRODUCTS = Path(__file__).resolve().parent / "data" / "robu_seed_products.json"
+ROBU_READER_PREFIX = "https://r.jina.ai/http://r.jina.ai/http://"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
 
 
 class RobuClient:
@@ -31,8 +37,14 @@ class RobuClient:
         self.delay_seconds = delay_seconds
         self.timeout = timeout
         self.cache = read_json(self.cache_path, {})
+        self.seed_products = read_json(SEED_PRODUCTS, [])
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": USER_AGENT})
+        self.session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://robu.in/",
+        })
 
     def enrich_bom(self, df: pd.DataFrame, enabled: bool = True, limit: int | None = None) -> dict[str, dict]:
         enrichments = {}
@@ -40,7 +52,11 @@ class RobuClient:
         for _, row in rows.iterrows():
             query = self._query_from_row(row)
             key = normalize_text(row.get("part_number")) or normalize_text(row.get("description")) or query
-            enrichments[key] = self.search(query, enabled=enabled)
+            product_url = _extract_robu_product_url(normalize_text(row.get("supplier_url", "")))
+            if product_url and enabled:
+                enrichments[key] = self.lookup_product_url(product_url, query=query)
+            else:
+                enrichments[key] = self.search(query, enabled=enabled)
         self.save()
         return enrichments
 
@@ -48,13 +64,18 @@ class RobuClient:
         query = normalize_text(query)
         if not query:
             return {"query": query, "status": "missing_query", "match_confidence": 0.0}
+        product_url = _extract_robu_product_url(query)
+        if product_url and enabled:
+            return self.lookup_product_url(product_url, query=query)
         key = cache_key(query)
         if key in self.cache:
             result = dict(self.cache[key])
-            result["from_cache"] = True
-            return result
+            stale_statuses = {"network_error", "offline_fallback", "missing_query"}
+            if not enabled or result.get("status") not in stale_statuses:
+                result["from_cache"] = True
+                return result
         if not enabled:
-            result = self._offline_guess(query)
+            result = self._seed_or_offline(query, status="offline_fallback")
             self.cache[key] = result
             return result
 
@@ -62,11 +83,30 @@ class RobuClient:
         url = f"https://robu.in/?s={quote_plus(query)}&post_type=product"
         try:
             response = self.session.get(url, timeout=self.timeout)
-            response.raise_for_status()
-            result = self._parse_search(query, url, response.text)
+            if response.status_code == 403 or "Just a moment" in response.text:
+                result = self._reader_search(query)
+            else:
+                response.raise_for_status()
+                result = self._parse_search(query, url, response.text)
         except requests.RequestException as exc:
-            result = self._offline_guess(query)
-            result.update({"status": "network_error", "error": str(exc), "source_url": url})
+            result = self._reader_search(query)
+            result.setdefault("error", str(exc))
+            result.setdefault("source_url", url)
+        self.cache[key] = result
+        return result
+
+    def lookup_product_url(self, product_url: str, query: str = "") -> dict:
+        """Parse a known Robu.in product URL directly."""
+
+        query = normalize_text(query) or product_url
+        product_url = _extract_robu_product_url(product_url) or product_url
+        key = cache_key(f"product:{product_url}")
+        if key in self.cache and self.cache[key].get("status") not in {"network_error", "offline_fallback"}:
+            result = dict(self.cache[key])
+            result["from_cache"] = True
+            return result
+        result = self._reader_product(query=query, product_url=product_url)
+        result["status"] = "ok_direct_product_url" if result.get("title") else result.get("status", "not_found")
         self.cache[key] = result
         return result
 
@@ -74,7 +114,13 @@ class RobuClient:
         write_json(self.cache_path, self.cache)
 
     def _query_from_row(self, row: pd.Series) -> str:
-        fields = [row.get("part_number"), row.get("manufacturer"), row.get("description"), row.get("value")]
+        fields = [
+            row.get("part_number"),
+            row.get("manufacturer"),
+            row.get("description"),
+            row.get("value"),
+            row.get("footprint"),
+        ]
         return " ".join(normalize_text(value) for value in fields if normalize_text(value))[:180]
 
     def _parse_search(self, query: str, url: str, html: str) -> dict:
@@ -113,6 +159,108 @@ class RobuClient:
         }
         return metadata
 
+    def _reader_search(self, query: str) -> dict:
+        for variant in _query_variants(query):
+            search_url = f"http://robu.in/?s={quote_plus(variant)}&post_type=product"
+            reader_url = f"{ROBU_READER_PREFIX}{search_url}"
+            try:
+                response = self.session.get(reader_url, timeout=self.timeout)
+                response.raise_for_status()
+                if "Performing security verification" not in response.text:
+                    links = _product_links_from_markdown(response.text)
+                    if links:
+                        result = self._reader_product(query, links[0])
+                        result["status"] = "ok_reader_search"
+                        result["search_url"] = f"https://robu.in/?s={quote_plus(variant)}&post_type=product"
+                        return result
+            except requests.RequestException:
+                pass
+
+        for product_url in self._web_search_product_links(query):
+            result = self._reader_product(query, product_url)
+            if result.get("title") and result.get("status") != "offline_fallback":
+                result["status"] = "ok_robu_web_search"
+                return result
+
+        seed = self._best_seed_match(query)
+        if seed:
+            result = self._reader_product(query, seed["source_url"], seed)
+            result["status"] = result.get("status", "seed_match")
+            result["match_confidence"] = max(result.get("match_confidence", 0.0), _seed_confidence(query, seed))
+            return result
+        return self._offline_guess(query)
+
+    def _web_search_product_links(self, query: str) -> list[str]:
+        links: list[str] = []
+        for variant in _query_variants(query):
+            search_query = f"site:robu.in/product {variant} Robu.in"
+            url = f"https://duckduckgo.com/html/?q={quote_plus(search_query)}"
+            try:
+                response = self.session.get(url, timeout=self.timeout)
+                response.raise_for_status()
+            except requests.RequestException:
+                continue
+            links.extend(_product_links_from_web_html(response.text))
+            if links:
+                break
+        unique = []
+        seen = set()
+        for link in links:
+            normalized = link.split("?")[0].rstrip("/")
+            if normalized not in seen:
+                unique.append(normalized)
+                seen.add(normalized)
+        return unique[:5]
+
+    def _reader_product(self, query: str, product_url: str, seed: dict | None = None) -> dict:
+        seed = seed or {}
+        normalized_url = product_url.replace("https://", "http://")
+        reader_url = f"{ROBU_READER_PREFIX}{normalized_url}"
+        try:
+            response = self.session.get(reader_url, timeout=self.timeout)
+            response.raise_for_status()
+            if "Performing security verification" not in response.text:
+                parsed = _parse_product_markdown(query, product_url, response.text)
+                return _merge_seed(seed, parsed)
+        except requests.RequestException:
+            pass
+        fallback = dict(seed) if seed else self._offline_guess(query)
+        fallback.update({
+            "query": query,
+            "status": "seed_match",
+            "source_url": product_url,
+            "similar_components": _similar_terms(seed.get("title", query)),
+        })
+        return fallback
+
+    def _best_seed_match(self, query: str) -> dict | None:
+        query_tokens = set(_tokenize(query))
+        best_score = 0.0
+        best = None
+        for product in self.seed_products:
+            keywords = set(_tokenize(" ".join(product.get("keywords", [])) + " " + product.get("title", "")))
+            if not keywords:
+                continue
+            overlap = len(query_tokens & keywords)
+            score = overlap / max(len(query_tokens), 1)
+            if score > best_score:
+                best_score = score
+                best = product
+        return best if best_score >= 0.18 else None
+
+    def _seed_or_offline(self, query: str, status: str) -> dict:
+        seed = self._best_seed_match(query)
+        if seed:
+            result = dict(seed)
+            result.update({
+                "query": query,
+                "status": status,
+                "similar_components": _similar_terms(seed.get("title", query)),
+                "match_confidence": _seed_confidence(query, seed),
+            })
+            return result
+        return self._offline_guess(query)
+
     def _offline_guess(self, query: str) -> dict:
         return {
             "query": query,
@@ -129,8 +277,159 @@ class RobuClient:
         }
 
 
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9][a-z0-9\-]{1,}", text.lower())
+
+
+def _extract_robu_product_url(text: str) -> str:
+    match = re.search(r"https?://(?:www\.|stg\.)?robu\.in/product/[^\s,;]+", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).rstrip(").]")
+
+
+def _query_variants(query: str) -> list[str]:
+    tokens = _tokenize(query)
+    variants = [query]
+    part_like = [token for token in tokens if any(char.isdigit() for char in token) and len(token) >= 4]
+    if part_like:
+        variants.append(" ".join(part_like[:3]))
+        variants.append(" ".join(part_like[:3]) + " through hole")
+        variants.append(" ".join(part_like[:3]) + " THT")
+    useful = [
+        token
+        for token in tokens
+        if token not in {"generic", "active", "unknown", "rohs", "component", "module"}
+    ]
+    if useful:
+        variants.append(" ".join(useful[:6]))
+    compact = query.replace("-", " ").replace("_", " ")
+    variants.append(compact)
+
+    lower_query = query.lower()
+    tht_terms = {"tht", "through", "hole", "through-hole", "dip", "axial", "radial", "terminal", "header", "connector"}
+    if any(term in lower_query for term in tht_terms):
+        base = " ".join(useful[:6]) if useful else compact
+        variants.extend([
+            f"{base} through hole",
+            f"{base} THT",
+            f"{base} DIP",
+            f"{base} axial radial",
+        ])
+    if any(term in lower_query for term in ["terminal", "screw", "block"]):
+        variants.append(f"{compact} screw terminal block")
+    if any(term in lower_query for term in ["header", "berg", "pin"]):
+        variants.append(f"{compact} berg strip header")
+    if any(term in lower_query for term in ["jst", "xh", "ph"]):
+        variants.append(f"{compact} JST connector")
+
+    deduped = []
+    seen = set()
+    for variant in variants:
+        clean = " ".join(variant.split()).strip()
+        if clean and clean.lower() not in seen:
+            deduped.append(clean[:140])
+            seen.add(clean.lower())
+    return deduped
+
+
+def _seed_confidence(query: str, seed: dict) -> float:
+    query_tokens = set(_tokenize(query))
+    seed_tokens = set(_tokenize(" ".join(seed.get("keywords", [])) + " " + seed.get("title", "")))
+    if not query_tokens:
+        return 0.2
+    return round(max(0.35, min(0.88, len(query_tokens & seed_tokens) / len(query_tokens))), 2)
+
+
+def _merge_seed(seed: dict, parsed: dict) -> dict:
+    merged = dict(seed)
+    for key, value in parsed.items():
+        if value in ("", None, []):
+            continue
+        if key == "availability" and value == "Unknown" and seed.get("availability"):
+            continue
+        if key == "title" and str(value).startswith(("Published Time:", "Warning:")) and seed.get("title"):
+            continue
+        merged[key] = value
+    return merged
+
+
+def _product_links_from_markdown(markdown: str) -> list[str]:
+    links = []
+    pattern = r"\[[^\]]+\]\((https?://(?:stg\.)?robu\.in/product/[^)\s]+)\)"
+    for match in re.finditer(pattern, markdown):
+        links.append(match.group(1))
+    links.extend(_product_links_from_web_html(markdown))
+    return links
+
+
+def _product_links_from_web_html(html_text: str) -> list[str]:
+    links = []
+    decoded_html = unescape(html_text)
+    for encoded in re.findall(r"uddg=([^&\"']+)", decoded_html):
+        decoded = unquote(encoded)
+        if re.match(r"https?://(?:stg\.)?robu\.in/product/", decoded):
+            links.append(decoded)
+    direct_pattern = r"https?://(?:stg\.)?robu\.in/product/[a-zA-Z0-9\-_%/]+"
+    links.extend(re.findall(direct_pattern, decoded_html))
+    return links
+
+
+def _parse_product_markdown(query: str, product_url: str, markdown: str) -> dict:
+    title = ""
+    title_match = re.search(r"Title:\s*(.+?)(?:\n|URL Source:)", markdown, flags=re.DOTALL)
+    if title_match:
+        title = title_match.group(1).strip()
+    for line in markdown.splitlines():
+        cleaned = line.strip("# ").strip()
+        if title:
+            break
+        if cleaned and not cleaned.startswith((
+            "Title:",
+            "URL Source:",
+            "Published Time:",
+            "Markdown Content:",
+            "Warning:",
+        )):
+            title = cleaned
+            break
+
+    availability = "Unknown"
+    if re.search(r"\bIn stock\b", markdown, flags=re.IGNORECASE):
+        availability = "In stock"
+    elif re.search(r"\bOut of stock\b", markdown, flags=re.IGNORECASE):
+        availability = "Out of stock"
+
+    price_match = re.search(r"(?:₹|Rs\.?)\s*[\d,.]+", markdown)
+    sku_match = re.search(r"SKU:\s*([A-Z0-9\-]+)", markdown, flags=re.IGNORECASE)
+    category_match = re.search(r"Category:\s*([^\n|]+)", markdown, flags=re.IGNORECASE)
+    brand_match = re.search(r"(?:Brand|Manufacturer):\s*\|?\s*([^\n|]+)", markdown, flags=re.IGNORECASE)
+    package_match = re.search(r"(?:Case/Package|Package|Mounting Type):\s*\|?\s*([^\n|]+)", markdown, flags=re.IGNORECASE)
+    datasheet_match = re.search(r"(https?://[^\s)]+\.pdf)", markdown, flags=re.IGNORECASE)
+
+    return {
+        "query": query,
+        "status": "ok_reader_product",
+        "title": title or query,
+        "category": category_match.group(1).strip() if category_match else _guess_category(title or query),
+        "manufacturer": brand_match.group(1).strip() if brand_match else _guess_manufacturer(title or query),
+        "package": package_match.group(1).strip() if package_match else _guess_package(title or query),
+        "datasheet_link": datasheet_match.group(1) if datasheet_match else "",
+        "availability": availability,
+        "price": price_match.group(0).replace("₹", "Rs") if price_match else "",
+        "sku": sku_match.group(1) if sku_match else "",
+        "similar_components": _similar_terms(title or query),
+        "source_url": product_url.replace("http://", "https://"),
+        "match_confidence": _match_confidence(query, title),
+    }
+
+
 def _guess_category(text: str) -> str:
     lowered = text.lower()
+    if any(term in lowered for term in ["terminal block", "screw terminal"]):
+        return "Terminal connector"
+    if any(term in lowered for term in ["header", "berg strip", "pin header", "jst"]):
+        return "Header connector"
     if any(term in lowered for term in ["resistor", "ohm"]):
         return "Passive resistor"
     if any(term in lowered for term in ["capacitor", "uf", "nf", "pf"]):
@@ -145,7 +444,22 @@ def _guess_category(text: str) -> str:
 
 
 def _guess_package(text: str) -> str:
-    match = re.search(r"\b(0201|0402|0603|0805|1206|sot-?\d+|soic-?\d+|qfn-?\d+|bga|dip-?\d+|to-?\d+)\b", text, re.IGNORECASE)
+    lowered = text.lower()
+    if "through-hole" in lowered or "through hole" in lowered or "tht" in lowered:
+        return "THT"
+    if "terminal block" in lowered or "screw terminal" in lowered:
+        return "Terminal block"
+    if "pin header" in lowered or "berg strip" in lowered:
+        return "Pin header"
+    if "axial" in lowered:
+        return "Axial"
+    if "radial" in lowered:
+        return "Radial"
+    match = re.search(
+        r"\b(0201|0402|0603|0805|1206|sot-?\d+|soic-?\d+|qfn-?\d+|bga|dip-?\d*|to-?\d+|jst-?[a-z0-9]+)\b",
+        text,
+        re.IGNORECASE,
+    )
     return match.group(0).upper() if match else ""
 
 
@@ -169,6 +483,8 @@ def _find_datasheet(product) -> str:
 
 def _similar_terms(text: str) -> list[str]:
     category = _guess_category(text)
+    if category in {"Terminal connector", "Header connector"}:
+        return ["through-hole connector", "standard pitch header", "screw terminal block"]
     if category == "Battery":
         return ["socketed battery holder", "standard replaceable cell", "RoHS-compliant holder"]
     if category == "Connector":
